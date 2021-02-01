@@ -10,14 +10,13 @@ sys.path.append(BASE_DIR)
 ros_path = '/opt/ros/kinetic/lib/python2.7/dist-packages'
 if ros_path in sys.path:
     sys.path.remove(ros_path)
-import cv2
 sys.path.append(ros_path)
 
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs.msg import *
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 from geometry_msgs.msg import Point
@@ -54,9 +53,11 @@ class RosVisualizer():
     def __init__(self, args):
         # Init ros
         rospy.init_node('Ros_Visualizer', anonymous=True)
-        self.predict_bbox = rospy.Publisher('/predict_bbox', MarkerArray, queue_size=1)
+        self.box_marker_pub = rospy.Publisher('/predict_bbox', MarkerArray, queue_size=1)
         self.point_pub = rospy.Publisher('/kitti_points', PointCloud2, queue_size=1)
+        self.box_center_pub = rospy.Publisher('/box_centers', String, queue_size=1)
         self.rate = rospy.Rate(args.pubRate)
+
         # Init Attributes
         self.KITTI_Folder = args.dataset_path
         self.KITTI_velo = os.path.join(self.KITTI_Folder, "velodyne")
@@ -65,6 +66,7 @@ class RosVisualizer():
         self.category = args.category
         self.save_path = args.save_path
         self.save_pcd = args.save_pcd
+
         print("KITTI_velo_path: ", self.KITTI_velo)
         print("KITTI_label_path: ", self.KITTI_label)
 
@@ -135,6 +137,7 @@ class RosVisualizer():
             frame_id = 0
             last_frame_id = 0
             corners_ = []
+            centers_ = []
 
             try:
                 for label_row in tqdm(range(length)):
@@ -145,27 +148,35 @@ class RosVisualizer():
                         this_pc, this_box, state = self.getBBandPC(this_anno)  # this_pc's shape is (3, N)
                         if state is True:
                             points = this_pc.points.T
-                            # pub box to show label
+                            # --------------------- pub box to show label
                             corners_.append(np.concatenate(this_box.corners().transpose(), axis=0))
-                            self.vis_bbox(np.array(corners_))
+                            corner_num = len(corners_)
+                            self.pub_box_markers(this_anno['frame'], np.array(corners_))
                             corners_ = []
+                            # -------------------- pub box center
+                            centers_.append(this_box.center)
+                            center_num = len(centers_)
+                            self.pub_box_centers(this_anno['frame'], np.array(centers_))
+                            centers_ = []
+                            # -------------------- save pcd
                             if self.save_pcd:
                                 file_name = get_name_by_read_dir(pcd_path)
                                 pc_save_pcd(points, pcd_path, file_name + '.pcd')
-                            # pub whole frame pc
-                            self.publish_pointcloud(points)
+                            # -------------------- pub whole frame pc
+                            self.publish_pointcloud(this_anno['frame'], points)
                             print("\n============================")
                             print(blue("scene: {} | frame: {}").format(this_anno['scene'], this_anno['frame']))
                             print(blue("pub pts with shape -> "), points.shape)
-
-                            if cv2.waitKey(1) == 45:
-                                exit()
+                            print(blue("pub markers with shape -> "), corner_num)
+                            print(blue("pub centers with shape -> "), center_num)
+                            # -------------------- sleeping
                             self.rate.sleep()
                         else:
                             print(red("Error! getBBandPC error"))
                     else:
                         _, this_box, state = self.getBBandPC(this_anno)  # this_pc's shape is (3, N)
                         if state is True:
+                            centers_.append(this_box.center)
                             corners_.append(np.concatenate(this_box.corners().transpose(), axis=0).tolist())
                         else:
                             print(red("Error! getBBandPC error"))
@@ -218,15 +229,15 @@ class RosVisualizer():
 
         return PC, BB, State
 
-    def publish_pointcloud(self, pts):
+    def publish_pointcloud(self, frame_num, pts):
         # pointcloud pub
         header = Header()
-        header.stamp = rospy.Time.now()
+        header.stamp = rospy.Time(frame_num)
         header.frame_id = 'velodyne'
         cloud_msg = pc2.create_cloud_xyz32(header, pts)
         self.point_pub.publish(cloud_msg)
 
-    def vis_bbox(self, corners):
+    def pub_box_markers(self, frame_num, corners):
         all_bbox = MarkerArray()
         for i, corner in enumerate(corners):
             point_0 = Point(corner[0], corner[1], corner[2])
@@ -243,7 +254,7 @@ class RosVisualizer():
             marker.ns = 'velodyne'
             marker.action = Marker.ADD
             marker.header.frame_id = "/velodyne"
-            marker.header.stamp = rospy.Time.now()
+            marker.header.stamp = rospy.Time(frame_num)
 
             marker.points.append(point_1)
             marker.points.append(point_2)
@@ -278,8 +289,14 @@ class RosVisualizer():
             marker.color.b = 0.0
             marker.text = str(1)
             all_bbox.markers.append(marker)
-        print(blue("pub markers with shape -> "), len(all_bbox.markers))
-        self.predict_bbox.publish(all_bbox)
+        self.box_marker_pub.publish(all_bbox)
+
+    def pub_box_centers(self, frame_num, centers):
+        data = String()
+        result = [frame_num] + np.concatenate(centers, axis=0).tolist()
+        result = map(str, result)
+        data = " ".join(result)
+        self.box_center_pub.publish(data)
 
     @staticmethod
     def read_calib_file(filepath):
@@ -323,7 +340,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_pcd', required=False, type=bool,
                         default=False, help='whether save whole frame pointcloud data as .pcd or not')
     parser.add_argument('--pubRate', required=False, type=int,
-                        default=5, help='The rate of topic publish in ros. /Hz')
+                        default=10, help='The rate of topic publish in ros. /Hz')
 
     args = parser.parse_args()
     kitti = RosVisualizer(args)
